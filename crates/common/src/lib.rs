@@ -13,6 +13,8 @@ pub(crate) mod external_storage_references;
 #[cfg(feature = "experimental")]
 pub(crate) mod external_storage_runner;
 #[doc(hidden)]
+pub mod external_storage_support;
+#[doc(hidden)]
 pub mod fsm_trait;
 #[doc(hidden)]
 pub mod payload_limits;

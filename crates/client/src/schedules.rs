@@ -19,7 +19,8 @@ use temporalio_common::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
-    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
+    external_storage_support::{StoreTarget, retrieve_external_payloads, store_external_payloads},
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         proto_ts_to_system_time,
@@ -33,6 +34,26 @@ use temporalio_common::{
 };
 use tonic::IntoRequest;
 use uuid::Uuid;
+
+/// The payloads a schedule carries are inputs to the workflows it starts.
+fn schedule_store_target(
+    namespace: &str,
+    schedule: Option<&schedule_proto::Schedule>,
+) -> Option<StoreTarget> {
+    match schedule?.action.as_ref()?.action.as_ref()? {
+        schedule_proto::schedule_action::Action::StartWorkflow(workflow) => {
+            Some(StoreTarget::workflow(
+                namespace,
+                &workflow.workflow_id,
+                "",
+                workflow
+                    .workflow_type
+                    .as_ref()
+                    .map_or("", |workflow_type| workflow_type.name.as_str()),
+            ))
+        }
+    }
+}
 
 /// Errors returned by schedule operations.
 #[derive(Debug, thiserror::Error)]
@@ -1236,7 +1257,8 @@ where
             request_id: Uuid::new_v4().to_string(),
             ..Default::default()
         };
-        store_external_payloads(&mut request, self.client.data_converter()).await?;
+        let target = schedule_store_target(&request.namespace, request.schedule.as_ref());
+        store_external_payloads(&mut request, self.client.data_converter(), target).await?;
         let mut request = request.into_request();
         rpc_options.apply_to(&mut request);
         WorkflowService::update_schedule(&mut self.client.clone(), request).await?;
@@ -1516,7 +1538,10 @@ impl Client {
                             request_id: Uuid::new_v4().to_string(),
                             ..Default::default()
                         };
-                        store_external_payloads(&mut request, client.data_converter()).await?;
+                        let target =
+                            schedule_store_target(&request.namespace, request.schedule.as_ref());
+                        store_external_payloads(&mut request, client.data_converter(), target)
+                            .await?;
                         let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         WorkflowService::create_schedule(&mut client, request).await?;

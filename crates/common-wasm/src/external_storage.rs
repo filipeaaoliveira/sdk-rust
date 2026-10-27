@@ -35,7 +35,8 @@ impl StorageDriverClaim {
 
 /// Identity of the workflow a payload is being stored on behalf of. Also used for workflow
 /// activities, which store against their owning workflow rather than themselves.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverWorkflowInfo {
     /// Workflow namespace.
@@ -50,7 +51,8 @@ pub struct StorageDriverWorkflowInfo {
 }
 
 /// Identity of a standalone activity a payload is being stored on behalf of.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverActivityInfo {
     /// Activity namespace.
@@ -178,8 +180,8 @@ impl ExternalStorageConcurrency {
 #[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverStoreContext {
-    /// The execution the payloads are being stored on behalf of, when there is one. The SDK does
-    /// not set this yet, so for now it is always `None`.
+    /// The execution the payloads are being stored on behalf of. `None` when the SDK cannot tell,
+    /// such as when an activity is completed through the client by its task token.
     pub target: Option<StorageDriverTargetInfo>,
     /// Limiter for this driver's store requests.
     pub limiter: Arc<dyn StorageDriverLimiter<Payload>>,
@@ -198,8 +200,8 @@ impl fmt::Debug for StorageDriverStoreContext {
 #[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverSelectContext {
-    /// The execution the payload is being stored on behalf of, when there is one. The SDK does not
-    /// set this yet, so for now it is always `None`.
+    /// The execution the payload is being stored on behalf of. `None` when the SDK cannot tell,
+    /// such as when an activity is completed through the client by its task token.
     pub target: Option<StorageDriverTargetInfo>,
 }
 
@@ -314,8 +316,6 @@ pub trait StorageDriverSelector: Send + Sync {
 /// This API is experimental and may change without notice. For now:
 ///
 /// - Heartbeat details recorded from inside an activity are not offloaded.
-/// - Drivers are not told which workflow or activity a payload belongs to: the `target` on
-///   [`StorageDriverStoreContext`] and [`StorageDriverSelectContext`] is always `None`.
 /// - Storage requests are not limited, so every request a message needs runs at once.
 /// - References are not passed through the payload codec, so their claim data is written to history
 ///   unencrypted, and a reference that another SDK encoded with a codec is not recognized.
