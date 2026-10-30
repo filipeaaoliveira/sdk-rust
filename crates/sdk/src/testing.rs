@@ -60,20 +60,49 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`WorkflowEnvironment::start_time_skipping`] owns a Temporal time-skipping test server instead.
+//! Time is skipped automatically while a workflow result is awaited through the environment's
+//! client, and can be moved explicitly with [`WorkflowEnvironment::sleep`].
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use temporalio_sdk::testing::{TimeSkippingWorkflowEnvironmentOptions, WorkflowEnvironment};
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let env =
+//!     WorkflowEnvironment::start_time_skipping(TimeSkippingWorkflowEnvironmentOptions::default())
+//!         .await?;
+//! // Workflows started through `env.client()` skip over timers while their results are awaited.
+//! env.sleep(Duration::from_secs(3600)).await?;
+//! env.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use crate::activities::{
     ActivityContext, ActivityDefinitions, ActivityError, ActivityHeartbeatCallback,
     ActivityImplementer, ActivityInfo, ExecutableActivity,
 };
+use futures_util::future::BoxFuture;
 use std::{
     any::Any,
     collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Client, ClientOptions, ConnectionOptions, Priority, errors::ClientConnectError,
+    Client, ClientOptions, Connection, ConnectionOptions, HistoryEventFilterType, Priority,
+    errors::{ClientConnectError, WorkflowInteractionError},
+    grpc::TestService,
+    interceptors::{
+        ClientInterceptor, FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, Next,
+    },
+    tonic::{self, IntoRequest},
 };
 use temporalio_common::{
     RetryPolicy,
@@ -81,7 +110,10 @@ use temporalio_common::{
         ActivitySerializationContext, GenericPayloadConverter, PayloadConversionError,
         PayloadConverter, SerializationContext, SerializationContextData, TemporalSerializable,
     },
-    protos::temporal::api::common::v1::Payload,
+    protos::temporal::api::{
+        common::v1::Payload,
+        testservice::v1::{LockTimeSkippingRequest, SleepRequest, UnlockTimeSkippingRequest},
+    },
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -89,6 +121,7 @@ use url::Url;
 use temporalio_sdk_core::ephemeral_server::{
     EphemeralExe as CoreEphemeralExe, EphemeralExeVersion as CoreEphemeralExeVersion,
     EphemeralServer, EphemeralServerError as CoreEphemeralServerError, TemporalDevServerConfig,
+    TestServerConfig,
 };
 
 type ActivityImplementers = HashMap<String, Arc<dyn Any + Send + Sync>>;
@@ -466,6 +499,34 @@ impl Default for LocalWorkflowEnvironmentOptions {
     }
 }
 
+/// Configuration for a local Temporal time-skipping test server and its client.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
+#[non_exhaustive]
+pub struct TimeSkippingWorkflowEnvironmentOptions {
+    /// Options used to create the namespace-bound client.
+    #[builder(default = ClientOptions::new("default").build())]
+    pub client_options: ClientOptions,
+    /// Existing or downloadable test server executable.
+    #[builder(default)]
+    pub server_executable: EphemeralExe,
+    /// Fixed frontend port, or an OS-selected port when absent.
+    pub port: Option<u16>,
+    /// Additional arguments appended to the test server invocation.
+    #[builder(default)]
+    pub extra_args: Vec<String>,
+    /// Maximum time to wait for test server readiness after spawning the process.
+    /// Defaults to five seconds. Does not include executable download time.
+    #[builder(default = Duration::from_secs(5))]
+    pub startup_timeout: Duration,
+}
+
+impl Default for TimeSkippingWorkflowEnvironmentOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// State for a workflow environment backed by an externally managed server.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -478,6 +539,124 @@ pub struct ExternalServer {
 #[non_exhaustive]
 pub struct LocalServer {
     server: EphemeralServer,
+}
+
+/// State for a workflow environment that starts a local time-skipping test server.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct TimeSkippingServer {
+    server: EphemeralServer,
+    time_skipping: Arc<TimeSkipping>,
+}
+
+/// Test service connection and automatic time-skipping switch shared with the client interceptor.
+#[derive(Debug)]
+struct TimeSkipping {
+    connection: Connection,
+    auto_enabled: AtomicBool,
+}
+
+/// Locks time-skipping when dropped unless disarmed, so that a caller dropping the future that
+/// awaits a workflow result (a timeout, a `select!`, a panicking test) cannot leave the server
+/// skipping time for the rest of the environment's life.
+struct RelockOnDrop(Option<Connection>);
+
+impl RelockOnDrop {
+    fn disarm(&mut self) -> Connection {
+        self.0.take().expect("relock guard is disarmed once")
+    }
+}
+
+impl Drop for RelockOnDrop {
+    fn drop(&mut self) {
+        let Some(mut connection) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(status) = connection
+                        .lock_time_skipping(LockTimeSkippingRequest {}.into_request())
+                        .await
+                    {
+                        tracing::warn!(
+                            %status,
+                            "failed to lock time-skipping after a result wait was dropped"
+                        );
+                    }
+                });
+            }
+            Err(_) => tracing::warn!(
+                "result wait dropped outside a Tokio runtime; time-skipping stays unlocked"
+            ),
+        }
+    }
+}
+
+/// Client interceptor that unlocks time-skipping around waiting for a workflow result.
+///
+/// `ClientInterceptor` has no hook for `get_result` itself, so this intercepts the history page
+/// fetch it performs, recognizable by its long-poll close-event options. That also covers handles
+/// obtained from the client after the workflow was started.
+struct TimeSkippingInterceptor(Arc<TimeSkipping>);
+
+impl ClientInterceptor for TimeSkippingInterceptor {
+    fn fetch_workflow_history_page<'a>(
+        &'a self,
+        input: FetchWorkflowHistoryPageInput,
+        next: Next<
+            'a,
+            FetchWorkflowHistoryPageInput,
+            BoxFuture<'a, Result<FetchWorkflowHistoryPageOutput, WorkflowInteractionError>>,
+        >,
+    ) -> BoxFuture<'a, Result<FetchWorkflowHistoryPageOutput, WorkflowInteractionError>> {
+        let awaiting_result = input.options.wait_new_event
+            && input.options.event_filter_type == HistoryEventFilterType::CloseEvent;
+        if !awaiting_result || !self.0.auto_enabled.load(Ordering::Relaxed) {
+            return next.run(input);
+        }
+        let mut test_service = self.0.connection.clone();
+        Box::pin(async move {
+            test_service
+                .unlock_time_skipping(UnlockTimeSkippingRequest {}.into_request())
+                .await
+                .map_err(WorkflowInteractionError::Rpc)?;
+            let mut relock = RelockOnDrop(Some(test_service));
+            let result = next.run(input).await;
+            let locked = relock
+                .disarm()
+                .lock_time_skipping(LockTimeSkippingRequest {}.into_request())
+                .await;
+            // A failed page fetch is the more useful error, so a lock failure only surfaces when
+            // the fetch itself succeeded.
+            match (result, locked) {
+                (Ok(output), Ok(_)) => Ok(output),
+                (Ok(_), Err(status)) => Err(WorkflowInteractionError::Rpc(status)),
+                (Err(error), _) => Err(error),
+            }
+        })
+    }
+}
+
+/// Guard returned by [`WorkflowEnvironment::auto_time_skipping_disabled`].
+///
+/// Automatic time-skipping is disabled while the guard is alive and restored when it is dropped,
+/// unless it was already disabled by an enclosing guard.
+#[derive(Debug)]
+#[must_use = "automatic time-skipping is re-enabled as soon as the guard is dropped"]
+pub struct AutoTimeSkippingDisabled<'a> {
+    time_skipping: &'a TimeSkipping,
+    was_enabled: bool,
+}
+
+impl Drop for AutoTimeSkippingDisabled<'_> {
+    fn drop(&mut self) {
+        if self.was_enabled {
+            self.time_skipping
+                .auto_enabled
+                .store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Client environment for workflow tests, parameterized by server ownership.
@@ -538,25 +717,7 @@ impl WorkflowEnvironment<LocalServer> {
             .await
             .map_err(EphemeralServerError::from_core)
             .map_err(WorkflowEnvironmentError::ServerStart)?;
-        let target = Url::parse(&format!("http://{}", server.target))
-            .map_err(WorkflowEnvironmentError::InvalidServerTarget)?;
-        let connection_options = ConnectionOptions::new(target)
-            .identity("temporalio-sdk-testing".to_owned())
-            .client_name("temporalio-sdk".to_owned())
-            .client_version(env!("CARGO_PKG_VERSION").to_owned())
-            .build();
-        let client = match Client::connect(connection_options, options.client_options).await {
-            Ok(client) => client,
-            Err(connect) => {
-                return match server.shutdown().await {
-                    Ok(()) => Err(WorkflowEnvironmentError::ClientConnect(connect)),
-                    Err(shutdown) => Err(WorkflowEnvironmentError::ClientConnectAndShutdown {
-                        connect: Box::new(connect),
-                        shutdown: Box::new(EphemeralServerError::from_core(shutdown)),
-                    }),
-                };
-            }
-        };
+        let client = connect_to_server(&mut server, options.client_options).await?;
         Ok(Self {
             client,
             state: LocalServer { server },
@@ -564,17 +725,149 @@ impl WorkflowEnvironment<LocalServer> {
     }
 
     /// Shut down the local server owned by this environment.
-    pub async fn shutdown(mut self) -> Result<(), WorkflowEnvironmentError> {
-        self.state
-            .server
-            .shutdown()
-            .await
-            .map_err(EphemeralServerError::from_core)
-            .map_err(WorkflowEnvironmentError::ServerShutdown)
+    pub async fn shutdown(self) -> Result<(), WorkflowEnvironmentError> {
+        shutdown_server(self.state.server).await
     }
 }
 
-/// Errors produced while creating or shutting down a workflow test environment.
+impl WorkflowEnvironment<TimeSkippingServer> {
+    /// Start a local Temporal time-skipping test server and connect a client to it.
+    ///
+    /// The server starts with time-skipping locked, so time passes normally. It is unlocked while a
+    /// workflow result is awaited through this environment's client, letting the server skip over
+    /// timers whenever no activity or other work is in flight, and locked again once the result is
+    /// available. Use [`sleep`](Self::sleep) to skip time explicitly and
+    /// [`auto_time_skipping_disabled`](Self::auto_time_skipping_disabled) to keep time locked while
+    /// awaiting a result.
+    ///
+    /// The test server implements a subset of Temporal server functionality, so prefer
+    /// [`start_local`](WorkflowEnvironment::<LocalServer>::start_local) for tests that do not need
+    /// time-skipping.
+    pub async fn start_time_skipping(
+        options: TimeSkippingWorkflowEnvironmentOptions,
+    ) -> Result<Self, WorkflowEnvironmentError> {
+        let server_config = TestServerConfig::builder()
+            .exe(options.server_executable.into_core())
+            .maybe_port(options.port)
+            .extra_args(options.extra_args)
+            .startup_timeout(options.startup_timeout)
+            .build();
+        let mut server = server_config
+            .start_server()
+            .await
+            .map_err(EphemeralServerError::from_core)
+            .map_err(WorkflowEnvironmentError::ServerStart)?;
+        let mut client = connect_to_server(&mut server, options.client_options).await?;
+        let time_skipping = Arc::new(TimeSkipping {
+            connection: client.connection().clone(),
+            auto_enabled: AtomicBool::new(true),
+        });
+        // Added after connecting so that the interceptor can hold the connection while connection
+        // plugins still run through `Client::connect`.
+        client
+            .options_mut()
+            .client_interceptors
+            .push(Arc::new(TimeSkippingInterceptor(time_skipping.clone())));
+        Ok(Self {
+            client,
+            state: TimeSkippingServer {
+                server,
+                time_skipping,
+            },
+        })
+    }
+
+    /// Advance the test server's clock by `duration`.
+    ///
+    /// Time-skipping is unlocked for the duration of the skip, so timers due within it fire, and
+    /// locked again afterwards.
+    pub async fn sleep(&self, duration: Duration) -> Result<(), WorkflowEnvironmentError> {
+        let duration = prost_types::Duration::try_from(duration)
+            .map_err(|_| WorkflowEnvironmentError::InvalidSleepDuration { duration })?;
+        self.test_service()
+            .unlock_time_skipping_with_sleep(
+                SleepRequest {
+                    duration: Some(duration),
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(WorkflowEnvironmentError::TimeSkipping)?;
+        Ok(())
+    }
+
+    /// Return the test server's current time, which runs ahead of wall-clock time once time has
+    /// been skipped.
+    pub async fn current_time(&self) -> Result<SystemTime, WorkflowEnvironmentError> {
+        let response = self
+            .test_service()
+            .get_current_time(().into_request())
+            .await
+            .map_err(WorkflowEnvironmentError::TimeSkipping)?
+            .into_inner();
+        response
+            .time
+            .and_then(|time| SystemTime::try_from(time).ok())
+            .ok_or(WorkflowEnvironmentError::InvalidCurrentTime)
+    }
+
+    /// Disable automatic time-skipping while awaiting workflow results until the returned guard is
+    /// dropped.
+    ///
+    /// Bind the guard to a named variable: `let _ = ...` drops it immediately. Nested guards must
+    /// be dropped in reverse order, or the outer one re-enables skipping while the inner one is
+    /// alive.
+    pub fn auto_time_skipping_disabled(&self) -> AutoTimeSkippingDisabled<'_> {
+        let time_skipping = &*self.state.time_skipping;
+        let was_enabled = time_skipping.auto_enabled.swap(false, Ordering::Relaxed);
+        AutoTimeSkippingDisabled {
+            time_skipping,
+            was_enabled,
+        }
+    }
+
+    /// Shut down the test server owned by this environment.
+    pub async fn shutdown(self) -> Result<(), WorkflowEnvironmentError> {
+        shutdown_server(self.state.server).await
+    }
+
+    fn test_service(&self) -> Connection {
+        self.state.time_skipping.connection.clone()
+    }
+}
+
+async fn connect_to_server(
+    server: &mut EphemeralServer,
+    client_options: ClientOptions,
+) -> Result<Client, WorkflowEnvironmentError> {
+    let target = Url::parse(&format!("http://{}", server.target))
+        .map_err(WorkflowEnvironmentError::InvalidServerTarget)?;
+    let connection_options = ConnectionOptions::new(target)
+        .identity("temporalio-sdk-testing".to_owned())
+        .client_name("temporalio-sdk".to_owned())
+        .client_version(env!("CARGO_PKG_VERSION").to_owned())
+        .build();
+    match Client::connect(connection_options, client_options).await {
+        Ok(client) => Ok(client),
+        Err(connect) => match server.shutdown().await {
+            Ok(()) => Err(WorkflowEnvironmentError::ClientConnect(connect)),
+            Err(shutdown) => Err(WorkflowEnvironmentError::ClientConnectAndShutdown {
+                connect: Box::new(connect),
+                shutdown: Box::new(EphemeralServerError::from_core(shutdown)),
+            }),
+        },
+    }
+}
+
+async fn shutdown_server(mut server: EphemeralServer) -> Result<(), WorkflowEnvironmentError> {
+    server
+        .shutdown()
+        .await
+        .map_err(EphemeralServerError::from_core)
+        .map_err(WorkflowEnvironmentError::ServerShutdown)
+}
+
+/// Errors produced while creating, driving, or shutting down a workflow test environment.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WorkflowEnvironmentError {
@@ -604,6 +897,18 @@ pub enum WorkflowEnvironmentError {
         /// Invalid database path.
         path: PathBuf,
     },
+    /// A time-skipping test service call failed.
+    #[error("time-skipping test service call failed: {0}")]
+    TimeSkipping(#[source] tonic::Status),
+    /// The requested sleep duration cannot be represented in the test service request.
+    #[error("sleep duration {duration:?} is out of range for the test server")]
+    InvalidSleepDuration {
+        /// Requested duration.
+        duration: Duration,
+    },
+    /// The test server returned a current time that cannot be represented as a system time.
+    #[error("test server returned an unrepresentable current time")]
+    InvalidCurrentTime,
 }
 
 #[cfg(test)]
