@@ -142,7 +142,7 @@ mod test_server {
     use super::*;
     use std::{
         sync::Arc,
-        time::{Instant, UNIX_EPOCH},
+        time::{Duration, Instant, UNIX_EPOCH},
     };
     use temporalio_client::{
         WorkflowQueryOptions, WorkflowSignalOptions, errors::WorkflowGetResultError,
@@ -291,14 +291,14 @@ mod test_server {
             .unwrap();
         let shutdown = worker.shutdown_handle();
         let (worker_result, ()) = tokio::join!(worker.run(), async {
-                // Without time-skipping this would take more than a day, so bound the wait.
-                let result = tokio::time::timeout(
-                    Duration::from_secs(60),
-                    handle.get_result(Default::default()),
-                )
-                .await
-                .expect("timer should be skipped well within a minute of wall time");
-                assert_eq!(result.unwrap(), "all done");
+            // Without time-skipping this would take more than a day, so bound the wait.
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                handle.get_result(Default::default()),
+            )
+            .await
+            .expect("timer should be skipped well within a minute of wall time");
+            assert_eq!(result.unwrap(), "all done");
             shutdown();
         });
         worker_result.unwrap();
@@ -325,27 +325,27 @@ mod test_server {
             .unwrap();
         let shutdown = worker.shutdown_handle();
         let (worker_result, ()) = tokio::join!(worker.run(), async {
-                let workflow_now = async || {
-                    handle
-                        .signal(TimerWorkflow::tick, (), WorkflowSignalOptions::default())
-                        .await
-                        .unwrap();
-                    let secs = handle
-                        .query(
-                            TimerWorkflow::last_tick_secs,
-                            (),
-                            WorkflowQueryOptions::default(),
-                        )
-                        .await
-                        .unwrap();
-                    UNIX_EPOCH + Duration::from_secs(secs)
-                };
-                assert_secs_from_now(workflow_now().await, 0);
-                let before = env.current_time().await.unwrap();
-                env.sleep(Duration::from_secs(1000)).await.unwrap();
-                let after = env.current_time().await.unwrap();
-                assert!(after.duration_since(before).unwrap() >= Duration::from_secs(1000));
-                assert_secs_from_now(workflow_now().await, 1000);
+            let workflow_now = async || {
+                handle
+                    .signal(TimerWorkflow::tick, (), WorkflowSignalOptions::default())
+                    .await
+                    .unwrap();
+                let secs = handle
+                    .query(
+                        TimerWorkflow::last_tick_secs,
+                        (),
+                        WorkflowQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                UNIX_EPOCH + Duration::from_secs(secs)
+            };
+            assert_secs_from_now(workflow_now().await, 0);
+            let before = env.current_time().await.unwrap();
+            env.sleep(Duration::from_secs(1000)).await.unwrap();
+            let after = env.current_time().await.unwrap();
+            assert!(after.duration_since(before).unwrap() >= Duration::from_secs(1000));
+            assert_secs_from_now(workflow_now().await, 1000);
             shutdown();
         });
         worker_result.unwrap();
@@ -381,19 +381,19 @@ mod test_server {
             .unwrap();
         let shutdown = worker.shutdown_handle();
         let (worker_result, ()) = tokio::join!(worker.run(), async {
-                let error = handle.get_result(Default::default()).await.unwrap_err();
-                let WorkflowGetResultError::Failed(failure) = error else {
-                    panic!("expected workflow failure, got {error:?}");
-                };
-                let mut cause: Option<&IncomingError> = Some(&failure);
-                let timeout = std::iter::from_fn(|| {
-                    let current = cause?;
-                    cause = current.cause();
-                    Some(current)
-                })
-                .find_map(|error| error.as_timeout())
-                .expect("workflow failure chain should contain a timeout");
-                assert_eq!(timeout.timeout_type(), TimeoutType::Heartbeat);
+            let error = handle.get_result(Default::default()).await.unwrap_err();
+            let WorkflowGetResultError::Failed(failure) = error else {
+                panic!("expected workflow failure, got {error:?}");
+            };
+            let mut cause: Option<&IncomingError> = Some(&failure);
+            let timeout = std::iter::from_fn(|| {
+                let current = cause?;
+                cause = current.cause();
+                Some(current)
+            })
+            .find_map(|error| error.as_timeout())
+            .expect("workflow failure chain should contain a timeout");
+            assert_eq!(timeout.timeout_type(), TimeoutType::Heartbeat);
             shutdown();
         });
         worker_result.unwrap();
@@ -441,17 +441,17 @@ mod test_server {
         };
         let shutdown = worker.shutdown_handle();
         let (worker_result, ()) = tokio::join!(worker.run(), async {
-                assert!(run_timer_workflow().await < skipped_threshold);
+            assert!(run_timer_workflow().await < skipped_threshold);
+            {
+                let _disabled = env.auto_time_skipping_disabled();
+                assert!(run_timer_workflow().await > real_time_threshold);
                 {
-                    let _disabled = env.auto_time_skipping_disabled();
-                    assert!(run_timer_workflow().await > real_time_threshold);
-                    {
-                        let _nested = env.auto_time_skipping_disabled();
-                    }
-                    // The inner guard must not re-enable skipping that the outer guard disabled.
-                    assert!(run_timer_workflow().await > real_time_threshold);
+                    let _nested = env.auto_time_skipping_disabled();
                 }
-                assert!(run_timer_workflow().await < skipped_threshold);
+                // The inner guard must not re-enable skipping that the outer guard disabled.
+                assert!(run_timer_workflow().await > real_time_threshold);
+            }
+            assert!(run_timer_workflow().await < skipped_threshold);
             shutdown();
         });
         worker_result.unwrap();
