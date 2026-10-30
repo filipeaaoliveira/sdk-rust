@@ -515,10 +515,6 @@ pub struct TimeSkippingWorkflowEnvironmentOptions {
     /// Additional arguments appended to the test server invocation.
     #[builder(default)]
     pub extra_args: Vec<String>,
-    /// Maximum time to wait for test server readiness after spawning the process.
-    /// Defaults to five seconds. Does not include executable download time.
-    #[builder(default = Duration::from_secs(5))]
-    pub startup_timeout: Duration,
 }
 
 impl Default for TimeSkippingWorkflowEnvironmentOptions {
@@ -750,7 +746,6 @@ impl WorkflowEnvironment<TimeSkippingServer> {
             .exe(options.server_executable.into_core())
             .maybe_port(options.port)
             .extra_args(options.extra_args)
-            .startup_timeout(options.startup_timeout)
             .build();
         let mut server = server_config
             .start_server()

@@ -1690,7 +1690,7 @@ pub mod temporal {
     pub mod api {
         pub mod activity {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.activity.v1");
+                include_proto_with_serde!("temporal.api.activity.v1");
             }
         }
         pub mod batch {
@@ -1700,7 +1700,7 @@ pub mod temporal {
         }
         pub mod callback {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.callback.v1");
+                include_proto_with_serde!("temporal.api.callback.v1");
             }
         }
         pub mod command {
@@ -2259,12 +2259,12 @@ pub mod temporal {
         }
         pub mod compute {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.compute.v1");
+                include_proto_with_serde!("temporal.api.compute.v1");
             }
         }
         pub mod deployment {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.deployment.v1");
+                include_proto_with_serde!("temporal.api.deployment.v1");
             }
         }
         pub mod enums {
@@ -2289,7 +2289,7 @@ pub mod temporal {
         }
         pub mod history {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.history.v1");
+                include_proto_with_serde!("temporal.api.history.v1");
                 pub use self::sdk_helpers::*;
                 mod sdk_helpers {
                     use super::*;
@@ -2637,12 +2637,12 @@ pub mod temporal {
         }
         pub mod sdk {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.sdk.v1");
+                include_proto_with_serde!("temporal.api.sdk.v1");
             }
         }
         pub mod taskqueue {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.taskqueue.v1");
+                include_proto_with_serde!("temporal.api.taskqueue.v1");
                 mod sdk_helpers {
                     use super::*;
                     use crate::protos::temporal::api::enums::v1::TaskQueueKind;
@@ -2666,7 +2666,7 @@ pub mod temporal {
         }
         pub mod update {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.update.v1");
+                include_proto_with_serde!("temporal.api.update.v1");
                 mod sdk_helpers {
                     use super::*;
                     use crate::protos::temporal::api::update::v1::outcome::Value;
@@ -2694,12 +2694,12 @@ pub mod temporal {
         }
         pub mod workflow {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.workflow.v1");
+                include_proto_with_serde!("temporal.api.workflow.v1");
             }
         }
         pub mod nexus {
             pub mod v1 {
-                tonic::include_proto!("temporal.api.nexus.v1");
+                include_proto_with_serde!("temporal.api.nexus.v1");
                 pub use self::sdk_helpers::*;
                 mod sdk_helpers {
                     use super::*;

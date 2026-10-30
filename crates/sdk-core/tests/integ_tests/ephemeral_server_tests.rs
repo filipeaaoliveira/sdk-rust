@@ -238,13 +238,9 @@ mod test_server {
     }
 
     async fn start_time_skipping_env() -> WorkflowEnvironment<TimeSkippingServer> {
-        WorkflowEnvironment::start_time_skipping(
-            TimeSkippingWorkflowEnvironmentOptions::builder()
-                .startup_timeout(Duration::from_secs(30))
-                .build(),
-        )
-        .await
-        .unwrap()
+        WorkflowEnvironment::start_time_skipping(TimeSkippingWorkflowEnvironmentOptions::default())
+            .await
+            .unwrap()
     }
 
     fn time_skipping_worker(client: &temporalio_client::Client, runtime: &Runtime) -> Worker {
@@ -280,7 +276,7 @@ mod test_server {
     async fn time_skipping_skips_timers_while_awaiting_result() {
         let env = start_time_skipping_env().await;
         let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-        let worker = time_skipping_worker(env.client(), &runtime);
+        let mut worker = time_skipping_worker(env.client(), &runtime);
         let task_queue = worker.task_queue().to_owned();
         assert_secs_from_now(env.current_time().await.unwrap(), 0);
 
@@ -293,8 +289,8 @@ mod test_server {
             )
             .await
             .unwrap();
-        worker
-            .run_until(async {
+        let shutdown = worker.shutdown_handle();
+        let (worker_result, ()) = tokio::join!(worker.run(), async {
                 // Without time-skipping this would take more than a day, so bound the wait.
                 let result = tokio::time::timeout(
                     Duration::from_secs(60),
@@ -303,9 +299,9 @@ mod test_server {
                 .await
                 .expect("timer should be skipped well within a minute of wall time");
                 assert_eq!(result.unwrap(), "all done");
-            })
-            .await
-            .unwrap();
+            shutdown();
+        });
+        worker_result.unwrap();
         assert_secs_from_now(env.current_time().await.unwrap(), 100_000);
         env.shutdown().await.unwrap();
     }
@@ -315,7 +311,7 @@ mod test_server {
     async fn time_skipping_sleep_advances_server_and_workflow_time() {
         let env = start_time_skipping_env().await;
         let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-        let worker = time_skipping_worker(env.client(), &runtime);
+        let mut worker = time_skipping_worker(env.client(), &runtime);
         let task_queue = worker.task_queue().to_owned();
 
         let handle = env
@@ -327,8 +323,8 @@ mod test_server {
             )
             .await
             .unwrap();
-        worker
-            .run_until(async {
+        let shutdown = worker.shutdown_handle();
+        let (worker_result, ()) = tokio::join!(worker.run(), async {
                 let workflow_now = async || {
                     handle
                         .signal(TimerWorkflow::tick, (), WorkflowSignalOptions::default())
@@ -350,9 +346,9 @@ mod test_server {
                 let after = env.current_time().await.unwrap();
                 assert!(after.duration_since(before).unwrap() >= Duration::from_secs(1000));
                 assert_secs_from_now(workflow_now().await, 1000);
-            })
-            .await
-            .unwrap();
+            shutdown();
+        });
+        worker_result.unwrap();
         env.shutdown().await.unwrap();
     }
 
@@ -361,7 +357,7 @@ mod test_server {
     async fn time_skipping_waits_for_running_activity_and_hits_heartbeat_timeout() {
         let env = Arc::new(start_time_skipping_env().await);
         let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-        let worker = Worker::new(
+        let mut worker = Worker::new(
             &runtime,
             env.client().clone(),
             WorkerOptions::new(format!("heartbeat-{}", rand_6_chars()))
@@ -383,8 +379,8 @@ mod test_server {
             )
             .await
             .unwrap();
-        worker
-            .run_until(async {
+        let shutdown = worker.shutdown_handle();
+        let (worker_result, ()) = tokio::join!(worker.run(), async {
                 let error = handle.get_result(Default::default()).await.unwrap_err();
                 let WorkflowGetResultError::Failed(failure) = error else {
                     panic!("expected workflow failure, got {error:?}");
@@ -398,9 +394,10 @@ mod test_server {
                 .find_map(|error| error.as_timeout())
                 .expect("workflow failure chain should contain a timeout");
                 assert_eq!(timeout.timeout_type(), TimeoutType::Heartbeat);
-            })
-            .await
-            .unwrap();
+            shutdown();
+        });
+        worker_result.unwrap();
+        drop(worker);
         Arc::into_inner(env)
             .expect("worker released its activity instances")
             .shutdown()
@@ -413,7 +410,7 @@ mod test_server {
     async fn time_skipping_can_be_disabled_with_guard() {
         let env = start_time_skipping_env().await;
         let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-        let worker = time_skipping_worker(env.client(), &runtime);
+        let mut worker = time_skipping_worker(env.client(), &runtime);
         let task_queue = worker.task_queue().to_owned();
         // With skipping the timer is nearly instant; without it the whole timer elapses. The gap
         // between the thresholds leaves room for a slow CI machine on either side.
@@ -442,8 +439,8 @@ mod test_server {
             );
             started.elapsed()
         };
-        worker
-            .run_until(async {
+        let shutdown = worker.shutdown_handle();
+        let (worker_result, ()) = tokio::join!(worker.run(), async {
                 assert!(run_timer_workflow().await < skipped_threshold);
                 {
                     let _disabled = env.auto_time_skipping_disabled();
@@ -455,9 +452,9 @@ mod test_server {
                     assert!(run_timer_workflow().await > real_time_threshold);
                 }
                 assert!(run_timer_workflow().await < skipped_threshold);
-            })
-            .await
-            .unwrap();
+            shutdown();
+        });
+        worker_result.unwrap();
         env.shutdown().await.unwrap();
     }
 

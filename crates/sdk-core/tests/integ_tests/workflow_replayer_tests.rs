@@ -115,6 +115,17 @@ fn replayer() -> WorkflowReplayer {
     .unwrap()
 }
 
+/// The fixture is the history of `SayHelloWorkflow` as `temporal workflow show --output json`
+/// exports it, with proto3 JSON field names, enum names, and string int64 values.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn workflow_replayer_replays_history_exported_by_temporal_cli() {
+    let history =
+        WorkflowHistory::from_json(include_bytes!("../histories/say_hello_cli_export.json"))
+            .unwrap();
+    replayer().replay_workflow(history).await.unwrap();
+}
+
 #[tokio::test]
 async fn workflow_replayer_replays_completed_workflow() {
     let (starter, mut worker) =

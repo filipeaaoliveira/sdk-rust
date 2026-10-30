@@ -209,8 +209,8 @@ impl From<HistoryInfo> for GetWorkflowExecutionHistoryResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::replay::TestHistoryBuilder;
-    use temporalio_common::protos::temporal::api::enums::v1::EventType;
+    use crate::replay::{TestHistoryBuilder, canned_histories};
+    use temporalio_common::protos::temporal::api::{enums::v1::EventType, history::v1::History};
 
     fn single_timer(timer_id: &str) -> TestHistoryBuilder {
         let mut t = TestHistoryBuilder::default();
@@ -238,5 +238,54 @@ mod tests {
         let hi = t.get_one_wft(2).unwrap();
         assert_eq!(hi.events().len(), 5);
         assert_eq!(hi.events()[0].event_id, 4);
+    }
+
+    /// Histories covering timers, activities, local activities, signals, child workflows,
+    /// cancellation, failures, and continue-as-new must survive the proto3 JSON mapping unchanged,
+    /// since that is the format the Temporal CLI and UI export and the other SDKs read.
+    #[test]
+    fn histories_round_trip_through_proto3_json() {
+        let histories = [
+            canned_histories::single_timer_wf_completes("t"),
+            canned_histories::cancel_timer("wait", "cancel"),
+            canned_histories::workflow_fails_with_failure_after_timer("t"),
+            canned_histories::single_activity("act"),
+            canned_histories::single_failed_activity("act"),
+            canned_histories::single_local_activity("la"),
+            canned_histories::scheduled_cancelled_activity_timeout("act", "sig"),
+            canned_histories::cancel_started_activity_with_activity_task_cancel("act", "sig"),
+            canned_histories::two_signals("sig1", "sig2"),
+            canned_histories::timer_then_continue_as_new("t"),
+            canned_histories::timer_wf_cancel_req_cancelled("t"),
+            canned_histories::single_child_workflow_fail("child"),
+            canned_histories::single_child_workflow_signaled("child", "sig"),
+            canned_histories::cancel_child_workflow_before_started_event("child"),
+        ];
+        for builder in histories {
+            let history = History::from(builder.get_full_history_info().unwrap());
+            let json = serde_json::to_string(&history).unwrap();
+            let decoded: History = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, history);
+        }
+    }
+
+    #[test]
+    fn history_json_follows_proto3_mapping() {
+        let history = History::from(
+            canned_histories::single_timer_wf_completes("t")
+                .get_full_history_info()
+                .unwrap(),
+        );
+        let json: serde_json::Value = serde_json::to_value(&history).unwrap();
+        let started = &json["events"][0];
+        assert_eq!(started["eventId"], "1");
+        assert_eq!(
+            started["eventType"],
+            "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED"
+        );
+        assert!(started["eventTime"].as_str().unwrap().ends_with('Z'));
+        assert!(started["workflowExecutionStartedEventAttributes"].is_object());
+        assert!(started.get("attributes").is_none());
+        assert!(started.get("event_type").is_none());
     }
 }
