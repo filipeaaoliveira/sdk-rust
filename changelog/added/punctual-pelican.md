@@ -1,0 +1,1 @@
+Added `WorkflowEnvironment::start_time_skipping`, which runs tests against Temporal's time-skipping test server. Time is skipped automatically while a workflow result is awaited through the environment's client, `sleep` and `current_time` move and read the server clock, and `auto_time_skipping_disabled` keeps time locked for a section of a test.

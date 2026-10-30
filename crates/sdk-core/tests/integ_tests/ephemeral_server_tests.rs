@@ -159,7 +159,326 @@ async fn temporal_cli_concurrent_starts() -> Result<(), Box<dyn std::error::Erro
 #[cfg(not(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64"))))]
 mod test_server {
     use super::*;
+    use std::{
+        sync::Arc,
+        time::{Instant, UNIX_EPOCH},
+    };
+    use temporalio_client::{
+        WorkflowQueryOptions, WorkflowSignalOptions, errors::WorkflowGetResultError,
+    };
+    use temporalio_common::{error::IncomingError, protos::temporal::api::common::v1::RetryPolicy};
+    use temporalio_macros::activities;
+    use temporalio_sdk::{
+        ActivityOptions, SyncWorkflowContext, TimeoutType, WorkflowContextView,
+        activities::{ActivityContext, ActivityError},
+        testing::{TimeSkippingServer, TimeSkippingWorkflowEnvironmentOptions},
+    };
     use temporalio_sdk_core::ephemeral_server::TestServerConfig;
+
+    #[workflow]
+    #[derive(Default)]
+    struct TimerWorkflow {
+        last_tick_secs: u64,
+    }
+
+    #[workflow_methods]
+    impl TimerWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>, timer_secs: u64) -> WorkflowResult<String> {
+            ctx.timer(Duration::from_secs(timer_secs)).await;
+            Ok("all done".to_owned())
+        }
+
+        /// Records workflow time, which only advances with workflow tasks, so that a following
+        /// query can report it.
+        #[signal]
+        fn tick(&mut self, ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.last_tick_secs = ctx
+                .workflow_time()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|since_epoch| since_epoch.as_secs())
+                .unwrap_or_default();
+        }
+
+        #[query]
+        fn last_tick_secs(&self, _ctx: &WorkflowContextView) -> u64 {
+            self.last_tick_secs
+        }
+    }
+
+    struct TimeSkippingActivities {
+        env: Arc<WorkflowEnvironment<TimeSkippingServer>>,
+    }
+
+    #[activities]
+    impl TimeSkippingActivities {
+        /// Skips twice the heartbeat timeout without heartbeating, so the attempt must time out.
+        #[activity]
+        async fn outlive_heartbeat_timeout(
+            self: Arc<Self>,
+            ctx: ActivityContext,
+            _: (),
+        ) -> Result<String, ActivityError> {
+            let heartbeat_timeout = ctx
+                .info()
+                .heartbeat_timeout
+                .expect("activity is scheduled with a heartbeat timeout");
+            self.env
+                .sleep(heartbeat_timeout * 2)
+                .await
+                .map_err(anyhow::Error::from)?;
+            Ok("all done".to_owned())
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct HeartbeatTimeoutWorkflow;
+
+    #[workflow_methods]
+    impl HeartbeatTimeoutWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+            let result = ctx
+                .execute_activity(
+                    TimeSkippingActivities::outlive_heartbeat_timeout,
+                    (),
+                    ActivityOptions::with_schedule_to_close_timeout(Duration::from_secs(1000))
+                        .heartbeat_timeout(Duration::from_secs(20))
+                        .retry_policy(RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+                .await?;
+            Ok(result)
+        }
+    }
+
+    async fn start_time_skipping_env() -> WorkflowEnvironment<TimeSkippingServer> {
+        WorkflowEnvironment::start_time_skipping(
+            TimeSkippingWorkflowEnvironmentOptions::builder()
+                .startup_timeout(Duration::from_secs(30))
+                .build(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn time_skipping_worker(client: &temporalio_client::Client, runtime: &Runtime) -> Worker {
+        Worker::new(
+            runtime,
+            client.clone(),
+            WorkerOptions::new(format!("time-skipping-{}", rand_6_chars()))
+                .register_workflow::<TimerWorkflow>()
+                .unwrap()
+                .build(),
+        )
+        .unwrap()
+    }
+
+    fn secs_from_now(time: SystemTime) -> i64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 - now
+    }
+
+    fn assert_secs_from_now(time: SystemTime, expected: i64) {
+        let actual = secs_from_now(time);
+        assert!(
+            (actual - expected).abs() <= 30,
+            "expected roughly {expected}s from now, got {actual}s"
+        );
+    }
+
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
+    #[tokio::test]
+    async fn time_skipping_skips_timers_while_awaiting_result() {
+        let env = start_time_skipping_env().await;
+        let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+        let worker = time_skipping_worker(env.client(), &runtime);
+        let task_queue = worker.task_queue().to_owned();
+        assert_secs_from_now(env.current_time().await.unwrap(), 0);
+
+        let handle = env
+            .client()
+            .start_workflow(
+                TimerWorkflow::run,
+                100_000,
+                WorkflowStartOptions::new(task_queue, format!("timer-{}", rand_6_chars())).build(),
+            )
+            .await
+            .unwrap();
+        worker
+            .run_until(async {
+                // Without time-skipping this would take more than a day, so bound the wait.
+                let result = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    handle.get_result(Default::default()),
+                )
+                .await
+                .expect("timer should be skipped well within a minute of wall time");
+                assert_eq!(result.unwrap(), "all done");
+            })
+            .await
+            .unwrap();
+        assert_secs_from_now(env.current_time().await.unwrap(), 100_000);
+        env.shutdown().await.unwrap();
+    }
+
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
+    #[tokio::test]
+    async fn time_skipping_sleep_advances_server_and_workflow_time() {
+        let env = start_time_skipping_env().await;
+        let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+        let worker = time_skipping_worker(env.client(), &runtime);
+        let task_queue = worker.task_queue().to_owned();
+
+        let handle = env
+            .client()
+            .start_workflow(
+                TimerWorkflow::run,
+                100_000,
+                WorkflowStartOptions::new(task_queue, format!("sleep-{}", rand_6_chars())).build(),
+            )
+            .await
+            .unwrap();
+        worker
+            .run_until(async {
+                let workflow_now = async || {
+                    handle
+                        .signal(TimerWorkflow::tick, (), WorkflowSignalOptions::default())
+                        .await
+                        .unwrap();
+                    let secs = handle
+                        .query(
+                            TimerWorkflow::last_tick_secs,
+                            (),
+                            WorkflowQueryOptions::default(),
+                        )
+                        .await
+                        .unwrap();
+                    UNIX_EPOCH + Duration::from_secs(secs)
+                };
+                assert_secs_from_now(workflow_now().await, 0);
+                let before = env.current_time().await.unwrap();
+                env.sleep(Duration::from_secs(1000)).await.unwrap();
+                let after = env.current_time().await.unwrap();
+                assert!(after.duration_since(before).unwrap() >= Duration::from_secs(1000));
+                assert_secs_from_now(workflow_now().await, 1000);
+            })
+            .await
+            .unwrap();
+        env.shutdown().await.unwrap();
+    }
+
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
+    #[tokio::test]
+    async fn time_skipping_waits_for_running_activity_and_hits_heartbeat_timeout() {
+        let env = Arc::new(start_time_skipping_env().await);
+        let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+        let worker = Worker::new(
+            &runtime,
+            env.client().clone(),
+            WorkerOptions::new(format!("heartbeat-{}", rand_6_chars()))
+                .register_workflow::<HeartbeatTimeoutWorkflow>()
+                .unwrap()
+                .register_activities(TimeSkippingActivities { env: env.clone() })
+                .build(),
+        )
+        .unwrap();
+        let task_queue = worker.task_queue().to_owned();
+
+        let handle = env
+            .client()
+            .start_workflow(
+                HeartbeatTimeoutWorkflow::run,
+                (),
+                WorkflowStartOptions::new(task_queue, format!("heartbeat-{}", rand_6_chars()))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        worker
+            .run_until(async {
+                let error = handle.get_result(Default::default()).await.unwrap_err();
+                let WorkflowGetResultError::Failed(failure) = error else {
+                    panic!("expected workflow failure, got {error:?}");
+                };
+                let mut cause: Option<&IncomingError> = Some(&failure);
+                let timeout = std::iter::from_fn(|| {
+                    let current = cause?;
+                    cause = current.cause();
+                    Some(current)
+                })
+                .find_map(|error| error.as_timeout())
+                .expect("workflow failure chain should contain a timeout");
+                assert_eq!(timeout.timeout_type(), TimeoutType::Heartbeat);
+            })
+            .await
+            .unwrap();
+        Arc::into_inner(env)
+            .expect("worker released its activity instances")
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
+    #[tokio::test]
+    async fn time_skipping_can_be_disabled_with_guard() {
+        let env = start_time_skipping_env().await;
+        let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+        let worker = time_skipping_worker(env.client(), &runtime);
+        let task_queue = worker.task_queue().to_owned();
+        // With skipping the timer is nearly instant; without it the whole timer elapses. The gap
+        // between the thresholds leaves room for a slow CI machine on either side.
+        let timer_secs = 5;
+        let skipped_threshold = Duration::from_millis(2500);
+        let real_time_threshold = Duration::from_secs(4);
+
+        let run_timer_workflow = async || {
+            let handle = env
+                .client()
+                .start_workflow(
+                    TimerWorkflow::run,
+                    timer_secs,
+                    WorkflowStartOptions::new(
+                        task_queue.clone(),
+                        format!("disabled-{}", rand_6_chars()),
+                    )
+                    .build(),
+                )
+                .await
+                .unwrap();
+            let started = Instant::now();
+            assert_eq!(
+                handle.get_result(Default::default()).await.unwrap(),
+                "all done"
+            );
+            started.elapsed()
+        };
+        worker
+            .run_until(async {
+                assert!(run_timer_workflow().await < skipped_threshold);
+                {
+                    let _disabled = env.auto_time_skipping_disabled();
+                    assert!(run_timer_workflow().await > real_time_threshold);
+                    {
+                        let _nested = env.auto_time_skipping_disabled();
+                    }
+                    // The inner guard must not re-enable skipping that the outer guard disabled.
+                    assert!(run_timer_workflow().await > real_time_threshold);
+                }
+                assert!(run_timer_workflow().await < skipped_threshold);
+            })
+            .await
+            .unwrap();
+        env.shutdown().await.unwrap();
+    }
 
     #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
