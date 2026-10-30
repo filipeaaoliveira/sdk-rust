@@ -22,6 +22,11 @@ use futures::{FutureExt, future::BoxFuture};
 use std::{collections::HashMap, sync::Arc};
 
 const PROTOBUF_ENCODING_VAL: &str = "binary/protobuf";
+#[cfg(feature = "serde_serialize")]
+const JSON_PROTOBUF_ENCODING_VAL: &str = "json/protobuf";
+/// Payload metadata key under which protobuf payload converters record the message's full name.
+#[cfg(feature = "serde_serialize")]
+const PROTOBUF_MESSAGE_TYPE_KEY: &str = "messageType";
 
 /// Combines a [`PayloadConverter`], [`FailureConverter`], and [`PayloadCodec`] to handle all
 /// serialization needs for communicating with the Temporal server.
@@ -872,6 +877,73 @@ where
     }
 }
 
+/// Wrapper for protobuf messages that implements [`TemporalSerializable`]/[`TemporalDeserializable`]
+/// using `json/protobuf` encoding, the proto3 JSON mapping the other SDKs' JSON protobuf payload
+/// converters read and write.
+///
+/// The payload carries the message's full protobuf name under the `messageType` metadata key.
+/// Unlike the other SDKs' converters, which only use that name to pick the type to decode into,
+/// decoding fails when a payload names a different message type than `T`, since `T` is fixed.
+#[cfg(feature = "serde_serialize")]
+pub struct ProstJsonSerializable<T: prost::Name>(pub T);
+#[cfg(feature = "serde_serialize")]
+impl<T> TemporalSerializable for ProstJsonSerializable<T>
+where
+    T: prost::Name + serde::Serialize + 'static,
+{
+    fn to_payload(&self, _: &SerializationContext<'_>) -> Result<Payload, PayloadConversionError> {
+        let data = serde_json::to_vec(&self.0)
+            .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))?;
+        Ok(Payload {
+            metadata: HashMap::from([
+                (
+                    ENCODING_PAYLOAD_KEY.to_string(),
+                    JSON_PROTOBUF_ENCODING_VAL.as_bytes().to_vec(),
+                ),
+                (
+                    PROTOBUF_MESSAGE_TYPE_KEY.to_string(),
+                    T::full_name().into_bytes(),
+                ),
+            ]),
+            data,
+            external_payloads: vec![],
+        })
+    }
+}
+#[cfg(feature = "serde_serialize")]
+impl<T> TemporalDeserializable for ProstJsonSerializable<T>
+where
+    T: prost::Name + serde::de::DeserializeOwned + 'static,
+{
+    fn from_payload(
+        _: &SerializationContext<'_>,
+        p: Payload,
+    ) -> Result<Self, PayloadConversionError>
+    where
+        Self: Sized,
+    {
+        let encoding = p.metadata.get(ENCODING_PAYLOAD_KEY).map(|v| v.as_slice());
+        if encoding != Some(JSON_PROTOBUF_ENCODING_VAL.as_bytes()) {
+            return Err(PayloadConversionError::WrongEncoding);
+        }
+        if let Some(message_type) = p.metadata.get(PROTOBUF_MESSAGE_TYPE_KEY)
+            && message_type.as_slice() != T::full_name().as_bytes()
+        {
+            return Err(PayloadConversionError::EncodingError(
+                format!(
+                    "payload message type {} does not match {}",
+                    String::from_utf8_lossy(message_type),
+                    T::full_name()
+                )
+                .into(),
+            ));
+        }
+        serde_json::from_slice(&p.data)
+            .map(ProstJsonSerializable)
+            .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))
+    }
+}
+
 /// A payload converter that delegates to an ordered list of inner converters.
 #[derive(Clone)]
 pub struct CompositePayloadConverter {
@@ -1151,5 +1223,115 @@ mod tests {
 
         let result: T = payloads.deserialize().unwrap();
         assert_eq!(result, value);
+    }
+
+    #[cfg(feature = "serde_serialize")]
+    mod json_protobuf {
+        use super::*;
+        use crate::protos::temporal::api::common::v1::{RetryPolicy, WorkflowExecution};
+        use std::time::Duration;
+
+        fn context() -> (PayloadConverter, SerializationContextData) {
+            (
+                PayloadConverter::default(),
+                SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
+        }
+
+        #[test]
+        fn encodes_proto3_json_with_message_type() {
+            let (converter, context_data) = context();
+            let ctx = SerializationContext::new(&context_data, &converter);
+            let policy = RetryPolicy {
+                initial_interval: Some(
+                    prost_types::Duration::try_from(Duration::from_secs(1)).unwrap(),
+                ),
+                maximum_attempts: 3,
+                ..Default::default()
+            };
+
+            let payload = converter
+                .to_payload(&ctx, &ProstJsonSerializable(policy.clone()))
+                .unwrap();
+
+            assert_eq!(
+                payload.metadata.get(ENCODING_PAYLOAD_KEY).unwrap(),
+                JSON_PROTOBUF_ENCODING_VAL.as_bytes()
+            );
+            assert_eq!(
+                payload.metadata.get(PROTOBUF_MESSAGE_TYPE_KEY).unwrap(),
+                b"temporal.api.common.v1.RetryPolicy"
+            );
+            // Field names follow the proto3 JSON mapping, and durations are strings.
+            let json: serde_json::Value = serde_json::from_slice(&payload.data).unwrap();
+            assert_eq!(json["maximumAttempts"], 3);
+            assert!(json["initialInterval"].as_str().unwrap().ends_with('s'));
+            let decoded: ProstJsonSerializable<RetryPolicy> =
+                converter.from_payload(&ctx, payload).unwrap();
+            assert_eq!(decoded.0, policy);
+        }
+
+        /// A payload as the Python SDK's `JSONProtoPayloadConverter` writes it.
+        fn python_payload(message_type: &str, data: &str) -> Payload {
+            Payload {
+                metadata: HashMap::from([
+                    (
+                        ENCODING_PAYLOAD_KEY.to_string(),
+                        JSON_PROTOBUF_ENCODING_VAL.as_bytes().to_vec(),
+                    ),
+                    (
+                        PROTOBUF_MESSAGE_TYPE_KEY.to_string(),
+                        message_type.as_bytes().to_vec(),
+                    ),
+                ]),
+                data: data.as_bytes().to_vec(),
+                external_payloads: vec![],
+            }
+        }
+
+        #[test]
+        fn decodes_payload_written_by_other_sdks() {
+            let (converter, context_data) = context();
+            let ctx = SerializationContext::new(&context_data, &converter);
+            let payload = python_payload(
+                "temporal.api.common.v1.WorkflowExecution",
+                r#"{"runId":"run-1","workflowId":"wf-1"}"#,
+            );
+
+            let decoded: ProstJsonSerializable<WorkflowExecution> =
+                converter.from_payload(&ctx, payload).unwrap();
+            assert_eq!(
+                decoded.0,
+                WorkflowExecution {
+                    workflow_id: "wf-1".to_owned(),
+                    run_id: "run-1".to_owned(),
+                }
+            );
+        }
+
+        #[test]
+        fn rejects_other_encodings_and_message_types() {
+            let (converter, context_data) = context();
+            let ctx = SerializationContext::new(&context_data, &converter);
+
+            let wrong_type = python_payload("temporal.api.common.v1.RetryPolicy", "{}");
+            assert!(matches!(
+                converter
+                    .from_payload::<ProstJsonSerializable<WorkflowExecution>>(&ctx, wrong_type),
+                Err(PayloadConversionError::EncodingError(_))
+            ));
+
+            let mut wrong_encoding =
+                python_payload("temporal.api.common.v1.WorkflowExecution", "{}");
+            wrong_encoding.metadata.insert(
+                ENCODING_PAYLOAD_KEY.to_string(),
+                PROTOBUF_ENCODING_VAL.as_bytes().to_vec(),
+            );
+            assert!(matches!(
+                converter
+                    .from_payload::<ProstJsonSerializable<WorkflowExecution>>(&ctx, wrong_encoding),
+                Err(PayloadConversionError::WrongEncoding)
+            ));
+        }
     }
 }

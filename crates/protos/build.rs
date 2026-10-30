@@ -11,26 +11,21 @@ static SERDE_ATTR: &str =
     "#[cfg_attr(feature = \"serde_serialize\", derive(::serde::Serialize, ::serde::Deserialize))]";
 
 /// Package prefixes that get conditional serde derive via type_attribute.
-/// Packages under `temporal.api` are listed individually to exclude the pbjson packages
-/// (temporal.api.common, temporal.api.enums, temporal.api.failure), which get their
-/// Serialize/Deserialize impls from generated .serde.rs files.
+/// Packages under `temporal.api` are listed individually to exclude the pbjson packages, which
+/// get proto3-JSON Serialize/Deserialize impls from generated .serde.rs files instead. Every
+/// package reachable from `temporal.api.history` is a pbjson package, so that histories exported
+/// by the Temporal CLI or UI round-trip through the proto3 JSON mapping.
 ///
 /// If you add a new proto package, add its prefix here unless it is also
 /// added to the pbjson_build list below.
 const SERDE_DERIVE_PREFIXES: &[&str] = &[
     ".coresdk",
     ".grpc",
-    ".temporal.api.activity",
     ".temporal.api.batch",
-    ".temporal.api.callback",
     ".temporal.api.cloud",
     ".temporal.api.command",
-    ".temporal.api.compute",
-    ".temporal.api.deployment",
     ".temporal.api.filter",
-    ".temporal.api.history",
     ".temporal.api.namespace",
-    ".temporal.api.nexus",
     ".temporal.api.nexusoperation",
     ".temporal.api.nexusservices",
     ".temporal.api.operatorservice",
@@ -39,12 +34,9 @@ const SERDE_DERIVE_PREFIXES: &[&str] = &[
     ".temporal.api.replication",
     ".temporal.api.rules",
     ".temporal.api.schedule",
-    ".temporal.api.taskqueue",
     ".temporal.api.testservice",
-    ".temporal.api.update",
     ".temporal.api.version",
     ".temporal.api.worker",
-    ".temporal.api.workflow",
     ".temporal.api.workflowservice",
 ];
 
@@ -192,11 +184,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let descriptors = std::fs::read(&descriptor_file)?;
     pbjson_build::Builder::new()
         .register_descriptors(&descriptors)?
+        // Applies to every pbjson package, not only histories: JSON written by a newer server or
+        // SDK may carry fields these protos do not know yet, and the other SDKs skip them too.
+        .ignore_unknown_fields()
         .build(&[
-            ".temporal.api.failure",
+            ".temporal.api.activity",
+            ".temporal.api.callback",
             ".temporal.api.common",
+            ".temporal.api.compute",
+            ".temporal.api.deployment",
             ".temporal.api.enums",
+            ".temporal.api.failure",
+            ".temporal.api.history",
+            ".temporal.api.nexus",
             ".temporal.api.sdk",
+            ".temporal.api.taskqueue",
+            ".temporal.api.update",
+            ".temporal.api.workflow",
         ])?;
 
     Ok(())

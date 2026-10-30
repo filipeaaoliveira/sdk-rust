@@ -398,13 +398,15 @@ pub enum WorkflowHistoryError {
 }
 
 impl WorkflowHistory {
-    /// Decode a workflow history from JSON bytes.
+    /// Decode a workflow history from proto3 JSON bytes, such as a file written by
+    /// `temporal workflow show --output json` or by [`to_json`](Self::to_json).
     pub fn from_json(bytes: &[u8]) -> Result<Self, WorkflowHistoryError> {
         let history: History = serde_json::from_slice(bytes)?;
         Ok(history.into())
     }
 
-    /// Fetch all remaining events and encode this workflow history as JSON bytes.
+    /// Fetch all remaining events and encode this workflow history as proto3 JSON bytes, in the
+    /// format the Temporal CLI, the Temporal UI, and the other SDKs' replayers read.
     pub async fn to_json(self) -> Result<Vec<u8>, WorkflowHistoryError> {
         Ok(serde_json::to_vec(&History {
             events: self.into_events().await?,

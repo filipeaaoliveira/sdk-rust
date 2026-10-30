@@ -1,0 +1,1 @@
+`ProstJsonSerializable` wraps protobuf messages as `json/protobuf` payloads (requires the `serde_serialize` feature), the encoding the other SDKs' JSON protobuf payload converters write, so Rust workflows and activities can exchange protobuf messages with them.
